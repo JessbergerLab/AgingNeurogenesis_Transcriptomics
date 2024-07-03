@@ -1,0 +1,183 @@
+---
+title: "Age clock of our scRNA-seq data"
+author: "Vladyslav Korobeynyk at Jessberger/Robinsonlab, UZH"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    code_download: true
+    number_sections: true
+    df_print: kable
+    theme: lumen
+params:
+  seed: 665
+---
+
+The goal is to generate a predictive model that is able to discriminate between different age groups (old, middle, young) using transcriptomic data. Here the model was build including all celltypes and age points.
+
+# Setup
+```{r setup, include=FALSE}
+# Load libraries
+library(Seurat)
+library(caret)
+library(dplyr)
+library(parallel)
+library(stringr)
+
+# label_1 , label_2
+# i.e. if label_1 cells in total are 62 and label_2 120, then the training set will consist of
+# 50% label_1 = 31 and 31 of label_2
+create_dataset_train_test_randomsampling = function(df, p , seed, labels ,scale) {
+    # df - data.frame that contains all data, rows are labels and columns are predictors
+    # p is a proportion of data to use for training (it takes the proportion of the less populated class of cells)
+    # seed - seed to sample randomly in each iterationlibrary(parallel)
+    # labels is a big vector with repeated elements (labels)
+    # scale - bool to indicate if to scale data or not
+
+    set.seed(seed)
+    names_labels = table(labels) %>% names    
+
+    if(scale == TRUE)
+    {
+        df = scale(df)
+    }
+
+    # Find which label has the least amount of samples
+    min_samples = table(labels) %>% min
+
+                            ### Train dataset
+
+    ## Split data separately for each label in labels to have the same proportion
+    # also generate labels for training data
+    tmp_lst_cellSampling_forTrain = list()
+    labels_train = vector()
+    for(label in names_labels)
+    {
+        n = sample(grep(label, labels), size = min_samples * p, replace = F)
+        tmp_lst_cellSampling_forTrain[[label]] = n
+        labels_train = append(labels_train, rep(label, length(n)))
+    }
+
+    # Create train and test data
+    df_train = df[c(unlist(tmp_lst_cellSampling_forTrain)),]
+    colnames(df_train) = gsub("[.,-]" , "_" , colnames(df_train))
+    
+    labels_train = labels[unlist(tmp_lst_cellSampling_forTrain)]
+
+                        #### Test dataset
+    
+    df_test = df[-c(unlist(tmp_lst_cellSampling_forTrain)),]
+    colnames(df_test) = gsub("[.,-]" , "_" , colnames(df_test))
+    
+    # Some gene names start with number like 1110008P14Rik, so append x before gene name
+    tmp_n = which(substr(colnames(df_test), 1, 1) %in% c(seq(0,10)))
+    colnames(df_test)[tmp_n] = as.list(colnames(df_test)[tmp_n]) %>% str_c("x" ,.) 
+    
+    labels_test = labels[-unlist(tmp_lst_cellSampling_forTrain)]
+    
+    
+    # Check if the labels assignment and dataframe of train set were subset correctly
+    stopifnot(names(labels_train) == rownames(df_train))
+    stopifnot(names(labels_test) == rownames(df_test))
+    # Generate label for test dataset
+    ret = list(
+        df_train = df_train %>% as.data.frame,
+        df_test = df_test %>% as.data.frame,
+        labels_train = labels_train %>% as.vector,
+        labels_test = labels_test %>% as.vector)
+    return(ret)
+}
+```
+
+# Load data
+```{r load_data_2, include=FALSE, eval=FALSE}
+SO = readRDS("seurat_Chromium_All.rds")
+
+# Some gene names start with number like 1110008P14Rik, so append x before gene name
+tmp_n = which(substr(rownames(SO@assays$RNA@counts), 1, 1) %in% c(seq(0,10)))
+rownames(SO@assays$RNA@counts)[tmp_n] = as.list(rownames(SO@assays$RNA@counts)[tmp_n]) %>% str_c("x" ,.) 
+rownames(SO@assays$RNA@data)[tmp_n] = as.list(rownames(SO@assays$RNA@data)[tmp_n]) %>% str_c("x" ,.) 
+
+# Remove from gene names "-" -> problem for formular creation
+rownames(SO@assays$RNA@counts) = gsub("-", ".", rownames(SO@assays$RNA@counts))
+rownames(SO@assays$RNA@data) = gsub("-", ".", rownames(SO@assays$RNA@data))
+
+# Change "-" for "_" in Cajal-Retzius
+SO@meta.data$Celltype = gsub("-","_",SO@meta.data$Celltype)
+
+# Find Most variable features
+SO = FindVariableFeatures(SO, selection.method = "vst", nfeatures = 5000)
+cell_types = SO@meta.data$Celltype %>% unique
+```
+
+Clustering at different Principal Components in the PCA
+
+# Build global model with all celltypes -> one for the paper {.tabset}
+```{r global_model}
+# Select cell type
+tmp_SO = SO[VariableFeatures(SO),]
+
+# Merge old samples
+tmp_SO$orig.ident[which(tmp_SO$orig.ident == "o2")] = "o1"
+tmp_SO$orig.ident[which(tmp_SO$orig.ident == "o1")] = "o"
+
+labels = tmp_SO@meta.data$orig.ident
+names(labels) = tmp_SO@meta.data %>% rownames
+
+# Transopose the dataframe to have cells as rows
+df = tmp_SO@assays$RNA@data %>% as.matrix %>% t %>% as.data.frame
+
+# Create test and train data
+data_randomsampling = create_dataset_train_test_randomsampling(df, p = 0.7,seed = 1,labels = labels,scale = FALSE)
+
+# Extract data
+data_train = data_randomsampling$df_train %>% data.frame
+data_train$label = data_randomsampling$labels_train
+data_test = data_randomsampling$df_test
+result = as.factor(data_randomsampling$labels_test)
+
+set.seed(1)
+# train the models
+# Cross validation 10 folds with 10-90 split
+ctrl = trainControl(method = "cv", number = 10, p = 0.9,classProbs = TRUE)
+model = train(label ~ . ,method = "glmnet", data = data_train,trControl = ctrl)
+pred_prob = predict(model, data_test, type = "prob")
+pred = predict(model, data_test)
+conf_matrix = caret::confusionMatrix(data = pred, reference = result)
+conf_matrix
+```
+
+## Performance_global_model  {.tabset}
+```{r performance_global_model}
+for(celltype in cell_types)
+{
+  ## The level of '#' below should be EXACTLY one less than the main one (above) which specifies {.tabset}
+  cat("## ", celltype, "\n")
+  pred_prob = pred_prob
+  pred_prob$true_classes = result
+  
+  ggplot(pred_prob, aes(x = y)) + 
+      geom_histogram(binwidth = .05) + 
+      facet_wrap(~true_classes) + 
+      xlab(paste0("Probability of Class ",celltype)) +
+      ggtitle(paste0("prediction of class ", celltype, " including all celltypes")) # for the main title
+  
+  tmp_df = data.frame(class = result)
+  tmp_df$prediction_class = pred_prob[,celltype]
+  
+  cal_obj = calibration(class ~ prediction_class,
+                         data = tmp_df,
+                         cuts = 13)
+  plot(cal_obj, type = "l", auto.key = list(columns = 3,
+                                            lines = TRUE,
+                                            points = FALSE))
+  cat('\n\n')
+}
+```
+
+# sessioninfo
+```{r }
+sessionInfo()
+```
