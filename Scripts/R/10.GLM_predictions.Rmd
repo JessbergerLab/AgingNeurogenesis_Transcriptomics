@@ -18,7 +18,7 @@ params:
 The goal is to generate a predictive model that is able to discriminate between different age groups (old, middle, young) using transcriptomic data. Here the model was build including all celltypes and age points.
 
 # Setup
-```{r setup, include=FALSE}
+```{r setup}
 # Load libraries
 library(Seurat)
 library(caret)
@@ -92,7 +92,7 @@ create_dataset_train_test_randomsampling = function(df, p , seed, labels ,scale)
 ```
 
 # Load data
-```{r load_data_2, include=FALSE, eval=FALSE}
+```{r load_data}
 SO = readRDS("seurat_Chromium_All.rds")
 
 # Some gene names start with number like 1110008P14Rik, so append x before gene name
@@ -106,16 +106,12 @@ rownames(SO@assays$RNA@data) = gsub("-", ".", rownames(SO@assays$RNA@data))
 
 # Change "-" for "_" in Cajal-Retzius
 SO@meta.data$Celltype = gsub("-","_",SO@meta.data$Celltype)
-
-# Find Most variable features
-SO = FindVariableFeatures(SO, selection.method = "vst", nfeatures = 5000)
-cell_types = SO@meta.data$Celltype %>% unique
 ```
 
 Clustering at different Principal Components in the PCA
 
-# Build global model with all celltypes -> one for the paper {.tabset}
-```{r global_model}
+# Build global model with all celltypes
+```{r global_model, warning=FALSE}
 # Select cell type
 tmp_SO = SO[VariableFeatures(SO),]
 
@@ -147,33 +143,154 @@ pred_prob = predict(model, data_test, type = "prob")
 pred = predict(model, data_test)
 conf_matrix = caret::confusionMatrix(data = pred, reference = result)
 conf_matrix
+
+# save model + data
+data = list(pred_prob = pred_prob,
+            data_test = data_test,
+            model = model, 
+            pred = pred,
+            conf_matrix = conf_matrix,
+            result = result)
+saveRDS(data,"prediction_AllCelltypes_glmnet.RDS")
 ```
 
-## Performance_global_model  {.tabset}
-```{r performance_global_model}
-for(celltype in cell_types)
+# Generate precision plots
+```{r generate_precision_plots, warning=FALSE, message=FALSE, fig.height= 16, fig.width=12}
+df_cellname_CT = data.frame(cellnames = rownames(tmp_SO@meta.data), celltype = tmp_SO@meta.data$Celltype, orig.ident = tmp_SO@meta.data$orig.ident)
+celltypes_vec = unique(SO@meta.data$Celltype)
+
+############ Generate list with plots of correctly classified cells for each celltype
+plots = list()
+statistics = list()
+for(CT in celltypes_vec)
 {
-  ## The level of '#' below should be EXACTLY one less than the main one (above) which specifies {.tabset}
-  cat("## ", celltype, "\n")
-  pred_prob = pred_prob
-  pred_prob$true_classes = result
+  # create dataframe with specific celltype
+  n = which(df_cellname_CT$celltype == CT)
+  df_helper = df_cellname_CT[n,]
   
-  ggplot(pred_prob, aes(x = y)) + 
-      geom_histogram(binwidth = .05) + 
-      facet_wrap(~true_classes) + 
-      xlab(paste0("Probability of Class ",celltype)) +
-      ggtitle(paste0("prediction of class ", celltype, " including all celltypes")) # for the main title
+  # extract expression  matrix for the celltype (because in the model we have all celltypes) and predict the cells according to the model
+  df_celltype = data$data_test[which(rownames(data$data_test) %in% df_helper$cellnames),]
+  pred = predict(data$model, df_celltype)  
   
-  tmp_df = data.frame(class = result)
-  tmp_df$prediction_class = pred_prob[,celltype]
+  # original labels of cells belonging to test data
+  result = data$result[which(rownames(data$data_test) %in% df_helper$cellnames)]
   
-  cal_obj = calibration(class ~ prediction_class,
-                         data = tmp_df,
-                         cuts = 13)
-  plot(cal_obj, type = "l", auto.key = list(columns = 3,
-                                            lines = TRUE,
-                                            points = FALSE))
-  cat('\n\n')
+  # Create dataframe to display correctly and incorrectly classified categories (9x3 df)
+  df = data.frame(true = result, pred = pred, int_predicted = ifelse(result == pred, 1, -1))
+  df = df %>% dplyr::group_by(true,pred) %>% summarise(summed = sum(int_predicted))
+  
+  # Tranform the previous dataframe to percentages by true age (all true young percentage have to add to 1) -> this df will be input to ggplot
+  df_helper = df %>% group_by(true) %>% summarise(percentage = summed/sum(abs(summed)))
+  df$percentage = (df_helper$percentage * 100) %>% abs
+  df$percentage = round(df$percentage,1)
+  df$color = ifelse(df$true == df$pred, "Correctly predicted", "Incorrectly predicted")
+  
+  df$true = factor(df$true, levels = c("y","m","o"))
+  df$pred = factor(df$pred, levels = c("y","m","o"))
+  
+  # Have to create dataframe in this way because we want to answer the question:
+  # "from young cells, how many cells were predicted correctly as young and how many not "
+  y_predicted_y = which(result == "y") %in% which(pred == "y")
+  m_predicted_m = which(result == "m") %in% which(pred == "m")
+  o_predicted_o = which(result == "o") %in% which(pred == "o")
+  
+  # extract f1score
+  x = caret::confusionMatrix(result,pred,mode = "everything")
+  f1_score = data.frame(x = x$byClass[,"F1"])
+  f1_score = f1_score[c(3,1,2),] %>% as.data.frame
+  colnames(f1_score) = CT
+  rownames(f1_score) = c("F1 Young Age","F1 Middle Age","F1 Old Age")
+  
+  # extract precision
+  precision_score = data.frame(x = x$byClass[,"Precision"])
+  precision_score = precision_score[c(3,1,2),] %>% as.data.frame
+  colnames(precision_score) = CT
+  rownames(precision_score) = c("Precision Young Age","Precision Middle Age","Precision Old Age")
+  
+  # extract recall
+  recall_score = data.frame(x = x$byClass[,"Recall"])
+  recall_score = recall_score[c(3,1,2),] %>% as.data.frame
+  colnames(recall_score) = CT
+  rownames(recall_score) = c("Recall Young Age","Recall Middle Age","Recall Old Age")
+  
+  # combine all statistics
+  statistics[[CT]] = rbind(precision_score,recall_score,f1_score)
+  
+  # Standard deviation of the mean as error bar
+  fnc = function(y_predicted_y,m_predicted_m,o_predicted_o) {str_wrap(c(paste0("Young age ","(",length(y_predicted_y)," cells)"),
+                                                                       paste0("Middle age ","(",length(m_predicted_m)," cells)"),
+                                                                       paste0("Old age  ","(",length(o_predicted_o)," cells)")), width = 13, indent = 3, exdent = 0)}
+  
+  
+  # extract legend as figure
+  if(CT == "Neuroblast")
+  {
+    p <- ggplot(df, aes(x=true, y = pred, color = color, label = percentage)) + 
+      geom_point(aes(size=percentage)) +
+      labs(x ="Chronological age", y = "Predicted age") +
+      scale_x_discrete(labels = fnc(y_predicted_y,m_predicted_m,o_predicted_o), expand =c(0.1,0.10)) +
+      scale_y_discrete(labels=c("y" = "Young age", "m" = "Middle age ",
+                                "o" = "Old age ")) +
+      theme_minimal() +
+      ggtitle(CT) +
+      theme(plot.title = element_text(hjust = 0.5,size = 8)) +
+      geom_text(data = df[df$color == "Correctly predicted",] , hjust=0, vjust=2.5, size = 3, color = "black") +
+      coord_fixed(ratio = 1)
+    
+    legend = cowplot::get_legend(p)
+  }
+  
+  # add y axis once per row
+  if(CT %in% c("qNSC","Microglia","SMC"))
+  {
+    p <- ggplot(df, aes(x=true, y = pred, color = color, label = percentage)) + 
+      geom_point(aes(size=percentage),show.legend = FALSE) +
+      labs(x ="Chronological age", y = "Predicted age") +
+      scale_x_discrete(labels = fnc(y_predicted_y,m_predicted_m,o_predicted_o), expand =c(0.1,0.10)) +
+      scale_y_discrete(labels=c("y" = "Young age", "m" = "Middle age ",
+                                "o" = "Old age ")) +
+      theme_minimal() +
+      ggtitle(CT) +
+      theme(plot.title = element_text(hjust = 0.5,size=8)) +
+      geom_text(data = df[df$color == "Correctly predicted",] , hjust=0, vjust=2.5, size = 3, color = "black") +
+      coord_fixed(ratio = 1)
+  } else {
+    p <- ggplot(df, aes(x=true, y = pred, color = color, label = percentage)) + 
+      geom_point(aes(size=percentage),show.legend = FALSE) +
+      labs(x ="Chronological age") +
+      scale_x_discrete(labels = fnc(y_predicted_y,m_predicted_m,o_predicted_o), expand =c(0.275,0.275)) +
+      scale_y_discrete(labels=c("y" = "Young age", "m" = "Middle age ",
+                                "o" = "Old age ")) +
+      theme_minimal() +
+      ggtitle(CT) +
+      geom_text(data = df[df$color == "Correctly predicted",] , hjust=0, vjust=2.5, size = 3, color = "black") +
+      theme(plot.title = element_text(hjust = 0.5,size=8),
+            axis.text.y=element_blank(),
+            axis.ticks.y=element_blank(),
+            axis.title.y = element_blank()) +
+      coord_fixed(ratio = 1)
+  }
+  
+  # generate plot
+  plots[[CT]] = p
+}
+
+########### SAVE ALL PLOTS IN THE SAME FIGURE
+x = ggpubr::ggarrange(plots$qNSC,plots$Neuroblast,plots$nIPC,plots$OPC,plots$Microglia,plots$Astrocyte,plots$Endothelial,
+                      plots$Pericyte,plots$SMC,plots$GC,plots$`Cajal-Retzius`,ggpubr::as_ggplot(legend) ,ncol = 4, nrow = 3)
+x
+tiff("precision_plots.tiff", units="in", width=12, height=11, res=300)
+x
+dev.off()
+
+############ SAVE INDIVIDUAL PLOTS AS TIFF
+dir.create("plots_prediction")
+setwd("plots_prediction/")
+for(plot in names(plots))
+{
+  tiff(paste0(plot,".tiff"), units="in", width=7, height=7, res=300)
+  print(plots[[plot]])
+  dev.off()
 }
 ```
 
